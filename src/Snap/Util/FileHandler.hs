@@ -5,7 +5,6 @@
 {-# LANGUAGE TupleSections #-}
 
 -- Bugs:
--- Doesn't take files without content-type
 -- Doesn't do multipart/mixed
 
 module Snap.Util.FileHandler where
@@ -118,8 +117,8 @@ pName = (string "Content-Disposition: form-data; name=\"") *> (untilChar '"') <*
 pFileName :: Parser FileName
 pFileName = (string "filename=\"") *> (untilChar '"') <* (word8 (c2w '"'))
 
-pContentType :: Parser ContentType
-pContentType = (string "Content-Type: ") *> getLine 
+pContentType :: Parser ContentType -- default is text/plain
+pContentType = ((string "Content-Type: ") *> getLine) <|> (pure "text/plain") 
 
 pFileInfo :: Parser FileInfo
 pFileInfo = FileInfo <$> ((string "; ") *> pFileName <* eol) <*>
