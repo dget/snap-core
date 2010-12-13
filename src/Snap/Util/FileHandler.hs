@@ -116,224 +116,80 @@ pParamHeaders :: Parser ParamHeaders
 pParamHeaders = ParamInfo <$> pName <*>
                              pmFileName <* eol
 
-data MultipartChunk = Boundary  Bool -- ^ True == final boundary
-                    | NextChunk ByteString
-                    deriving Show
-
-getLineIncludingLF :: Parser ByteString
-getLineIncludingLF = do
-  s <- takeWhile (/=(c2w '\n'))
-  char '\n'
-
-  -- snoc is ugly, but nothing better
-  return $ S.snoc s (c2w '\n')
-
-getNextChunk :: ByteString -> Parser MultipartChunk
-getNextChunk boundary = checkBoundary <|>
-                        chunkWithoutNewlines <|>
-                        chunkWithNewlines
+grabPart :: (Monad m) => Enumeratee MatchInfo ByteString m a
+grabPart = checkDone go
   where
-    checkBoundary = try $ Boundary <$> pBoundary boundary
-    
-    chunkWithoutNewlines = try $ do
-      ensure bUFSIZ
-      s <- A.take bUFSIZ
-      if S.any (== (c2w '\n')) s
-         then empty -- fail and will backtrack since there's a newline
-         else return $ NextChunk s
+    go :: (Monad m) => (Stream ByteString -> Iteratee ByteString m a) 
+                    -> Iteratee MatchInfo m (Step ByteString m a)
+    go k =
+      Snap.Iteratee.head >>= maybe (finish k) (process k)
 
-    chunkWithNewlines = NextChunk <$> getLineIncludingLF
+    -- called when outer stream is EOF
+    finish :: (Monad m) => (Stream ByteString -> Iteratee ByteString m a) 
+                        -> Iteratee MatchInfo m (Step ByteString m a)
+    finish k = lift $ runIteratee $ k EOF
 
-handlePartBody :: ByteString
-               -> ParamHeaders                               -- already parsed
-               -> (ParamHeaders -> Iteratee ByteString IO a) -- handler
-               -> Iteratee ByteString IO (a, Bool)
-handlePartBody boundary headers userHandler = do
-  -- turn client iteratee into a step
-  userStep <- lift $ runIteratee $ userHandler headers
+    -- no match ==> pass the stream chunk along
+    process :: (Monad m) => (Stream ByteString -> Iteratee ByteString m a) 
+                         -> MatchInfo
+                         -> Iteratee MatchInfo m (Step ByteString m a)
+    process k (NoMatch s) = do
+      step <- lift $ runIteratee $ k $ Chunks [s]
+      checkDone go step
 
-  -- lift the step up to be (a, False) - the false will be replaced by loop
-  -- and start the loop
+    process k (Match _) = lift $ runIteratee $ k EOF
 
-  joinI $ checkDone loop $ liftStep userStep
+grabParts :: (Monad m) => Iteratee ByteString m a
+                       -> Iteratee MatchInfo m [a]
+grabParts partIter = do
+  let iter = partIter >>= \x -> skipToEof >> return x
+  go iter []
+  where
+    go :: (Monad m) => Iteratee ByteString m a 
+                    -> [a] -- replace with DList
+                    -> Iteratee MatchInfo m [a]
+    go iter soFar = do
+      b <- isEOF
+      if b
+        then return soFar
+        else do
+          -- step :: Step ByteString m a
+          step <- lift $ runIteratee iter
+
+          -- grabPart step :: Iteratee MatchInfo m (Step ByteString m a)
+          innerStep <- grabPart step
+
+          -- output :: a 
+          output <- lift $ run_ $ returnI innerStep
+
+          -- and recurse
+          go iter (output : soFar)
+
+
+internalHandleMultipart :: (MonadIO m) => ByteString -- boundary
+                                     -> (ParamHeaders -> Iteratee ByteString m a)
+                                     -> Iteratee ByteString m [a]
+internalHandleMultipart bound clientHandler = do
+  -- kmpEnumeratee bound :: Enumeratee ByteString MatchInfo m1 a1
+  -- runIteratee $ grabParts clientIter :: m (Step MatchInfo m [a])
+  partsStep <- lift $ runIteratee $ grabParts $ compressIteratee clientHandler
+  enumStep  <- iterateeDebugWrapper "kmp" $ kmpEnumeratee fullBound partsStep
+
+  output <- lift $ run_ $ returnI enumStep
+  return output
 
   where 
-  finish :: Monad m => Bool 
-         -> Iteratee a m b
-         -> Iteratee a m (b, Bool)
-  finish t iter = liftM (,t) iter
+    fullBound = S.concat ["--", bound, "\n"]
 
-  replacesnd :: Monad m => Bool
-             -> Iteratee a m (b, Bool)
-             -> Iteratee a m (b, Bool)
-  replacesnd t iter = liftM (repl t) iter
-    where repl x (a, _) = (a, x)
+    compressIteratee :: (MonadIO m) => (ParamHeaders -> Iteratee ByteString m a) -> Iteratee ByteString m a
+    compressIteratee handler = do
+--      headers <- iterateeDebugWrapper "header parser" $ iterParser pParamHeaders
+      handler $ ParamInfo "input1" Nothing
+
   
-  -- takes the step, raises b to (b, Bool), sets the bool false..
-  liftStep :: Monad m => Step a m b -> Step a m (b, Bool)
-  liftStep (Continue k) = Continue ((finish False) . k)
-  liftStep (Yield x y) = Yield (x, False) y
-  liftStep (Error err) = Error err
-
-  checkDone' :: Enumeratee ByteString ByteString IO (a, Bool)
-  checkDone' (Yield x chunk) = return $ Yield x chunk
-  checkDone' (Error e) = return $ Error e
-    
-
-  loop :: (Stream ByteString -> Iteratee ByteString IO (a, Bool)) 
-       -> Iteratee ByteString IO (Step ByteString IO (a, Bool))
-  loop k = do
-
-    nextChunk <- iterateeDebugWrapper "next chunk parser" $ iterParser $ getNextChunk boundary
-
-
-    case nextChunk of
-      (Boundary lastBoundary) -> do
-          replacesnd lastBoundary $ k EOF
-          lift $ runIteratee $ replacesnd lastBoundary $ k EOF
-      (NextChunk s) -> do
-        step <- lift $ runIteratee $ k $ Chunks [s]
-        checkDone loop step
-
-handlePartBody' :: ByteString
-                -> ParamHeaders                               -- already parsed
-                -> (ParamHeaders -> Iteratee ByteString IO a) -- handler
-                -> Iteratee ByteString IO (a, Bool)
-handlePartBody' boundary headers handler = do 
-    userStep <- lift $ runIteratee $ handler headers
-    handleStep <- lift $ runIteratee $ iterateeDebugWrapper "part handler" $ partHandler userStep
-
-    iterateeDebugWrapper "kmp" $ joinI' $ kmpEnumeratee trueBoundary handleStep
-  where
-    trueBoundary = S.append "--" boundary
-  
-    -- modifying joinI to also flatten any remaining MatchInfo
-    joinI' :: Iteratee ByteString IO (Step MatchInfo IO b) -> Iteratee ByteString IO b
-    joinI' outer = do
-        step <- lift $ runIteratee $ outer
-        case step of
-          Error e -> throwError e
-          Continue k -> joinI' $ continue k
-          Yield b (Chunks xs) -> (debug $ show xs) >> check b xs
-     where
-       check (Continue k) xs = k EOF >>== \s -> case s of
-        	Continue _ -> error "joinI: divergent iteratee"
-        	_ -> check s xs
-       check (Yield x (Chunks a)) xs = yield x $ Chunks $ xs ++ map m2b a
-       check (Error e) _ = throwError e
---    where
---      check (Error e) = throwError e
---      check (Continue k) =  k
-
-    -- joinI' outer = outer >>= check where
-    --     check (Continue k) = k EOF >>== \s -> case s of
-    --     	Continue _ -> error "joinI: divergent iteratee"
-    --     	_ -> check s
-    --     check (Yield x (Chunks a)) = yield x $ Chunks $ map m2b a
-    --     check (Error e) = throwError e
-
-    m2b :: MatchInfo -> ByteString
-    m2b (Match a) = a
-    m2b (NoMatch a) = a
-
-    -----------------------------------------------------------
-    -- This should take a user step which handles the body. 
-    -- If a NoMatch is found, should take it, and either wait for more, or for a match
-    -- depending on the result from the continuation.
-    -- If a Match is found, should feed an EOF into the continuation, and pass the 
-    -- result and Match to waitForMatch if value given, error otherwise
-    -- If empty, will issue a continuation that takes a NoMatch (this)
-    -----------------------------------------------------------
-    contFun :: (Stream ByteString -> Iteratee ByteString IO a) -- user step continuation
-            -> Stream MatchInfo 
-            -> Iteratee MatchInfo IO (a, Bool)
-    contFun f (Chunks []) = continue $ contFun f
-    contFun f (Chunks ((NoMatch a):xs)) = do
-        debug $ "NoMatch: " ++ show a
-        userStep' <- lift $ runIteratee $ iterateeDebugWrapper "user handler" $ 
-                     f $ Chunks [a]
-        case userStep' of
-          (Error e)    -> throwError e
-          (Yield b _)  -> iterateeDebugWrapper "waiting for match" $ waitForMatch b $ Chunks xs
-          (Continue k) -> contFun k $ Chunks xs
-    contFun f c@(Chunks ((Match a): xs)) = do
-        debug $ "match: " ++ show a
-        userStep' <- lift $ runIteratee $ f $ EOF
-        case userStep' of
-          (Error e)    -> throwError e
-          (Yield b _)  -> iterateeDebugWrapper "waiting for match" $ waitForMatch b c
-          (Continue k) -> error "divergent iteratee"
-    contFun f EOF = error "not enough input"
-
-    -- discards NoMatch until it finds a match, then yields the values.
-    waitForMatch :: a -> Stream MatchInfo -> Iteratee MatchInfo IO (a, Bool)
-    waitForMatch ret (Chunks []) = continue $ waitForMatch ret
-    waitForMatch ret (Chunks ((NoMatch a):xs)) = waitForMatch ret $ Chunks xs
-    waitForMatch ret (Chunks ((Match a):xs))   = do
-        parseStep <- lift $ runIteratee $ iterParser $ (pBoundary boundary)
-        -- the actual boundary
-        pStep  <- lift $ runIteratee $ case parseStep of 
-          (Error e)    -> throwError e
-          (Yield b _)  -> error "unreachable case"
-          (Continue k) -> k $ Chunks [a]
-
-        case pStep of
-          (Error e)    -> throwError e
-          (Continue k) -> boundaryContinue ret k $ Chunks xs -- the eol or "--"
-          (Yield b _) -> error "unreachable case"
-    waitForMatch ret EOF = error "not enough input"
-
-    -- should keep feeding data from NoMatch until either errors or yield 
-    boundaryContinue :: a  -- the value to return
-                     -> (Stream ByteString -> Iteratee ByteString IO Bool)
-                                                    -- parser continuation   
-                     -> Stream MatchInfo -- the stream
-                     -> Iteratee MatchInfo IO (a, Bool)
-    boundaryContinue ret p (Chunks []) = continue $ boundaryContinue ret p 
-    boundaryContinue ret p (Chunks ((NoMatch a):xs)) = do
-      pStep <- lift $ runIteratee $ p $ Chunks [a]
-      case pStep of
-        (Continue k)           -> boundaryContinue ret k $ Chunks xs 
-        (Yield b (Chunks xs')) -> yield (ret, b) $ Chunks (map NoMatch xs' ++ xs)
-        (Error e)              -> throwError e
-
-    partHandler :: Step ByteString IO a -> Iteratee MatchInfo IO (a, Bool) 
-    partHandler (Yield b _) = return $ (b, False)
-    partHandler (Error e)   = throwError e
-    partHandler (Continue k) = continue $ contFun k
-    
-
-internalHandleMultipart :: ByteString
-                        -> (ParamHeaders -> Iteratee ByteString IO a)
-                        -> Iteratee ByteString IO [a]
-internalHandleMultipart boundary userHandler = do
-  finished <- iterateeDebugWrapper "first boundary" $ iterParser $ parseFirstBoundary boundary
-  if finished
-    then return []
-    else go []
-
-  where
-    go l = do
-      headers <- iterateeDebugWrapper "headers" $ iterParser pParamHeaders
-      debug $ show $ name headers
-
-      (x, finished) <- handlePartBody' boundary headers userHandler
-
-      let l' = x:l
-
-      if finished
-        then return l'
-        else go l'
-
-
 ------
 testHandler :: ParamHeaders -> Iteratee ByteString IO [ByteString]
-testHandler h = do
-  case fileInfo h of 
-    Nothing ->  do
-      consume
-    Just _  -> do
-      consume
+testHandler _ = consume
 
 --
 testStr :: ByteString
