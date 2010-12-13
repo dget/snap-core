@@ -4,6 +4,10 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 
+-- Bugs:
+-- Doesn't take files without content-type
+-- Doesn't do multipart/mixed
+
 module Snap.Util.FileHandler where
 
 import           Control.Applicative
@@ -50,6 +54,7 @@ bUFSIZ = 8192
 handleFileUpload :: MonadSnap m => (ParamHeaders -> Iteratee ByteString IO a) -> m [a]
 handleFileUpload f = do
      req <- getRequest
+     debug $ show $ multipartBoundary req
      case multipartBoundary req of
        Nothing -> return []
        Just x  -> do
@@ -58,7 +63,7 @@ handleFileUpload f = do
 multipartBoundary :: Request -> Maybe S.ByteString
 multipartBoundary req = do 
   x <- getHeader "Content-Type" req
-  return $ S.drop 21 x
+  return $ S.drop 30 x
 
 -- parser
 sp, digit, letter :: Parser Word8
@@ -78,11 +83,10 @@ eol = (string "\n") <|> (string "\r\n")
 crlf :: Parser ByteString
 crlf = string "\r\n"
 
-pBoundary :: ByteString -> Parser Bool
+pBoundary :: ByteString -> Parser ByteString
 pBoundary boundary = try $ do
   string "--"
   string boundary
-  (eol *> pure False) <|> (string "--" *> pure True)
   
 getLine :: Parser ByteString
 getLine =  takeWhile (not . isEndOfLine) <* eol
@@ -90,8 +94,21 @@ getLine =  takeWhile (not . isEndOfLine) <* eol
 takeLine :: Parser ()
 takeLine = getLine *> pure ()
 
-parseFirstBoundary :: ByteString -> Parser Bool
+
+parseFirstBoundary :: ByteString -> Parser ByteString
 parseFirstBoundary b = pBoundary b <|> (takeLine *> parseFirstBoundary b)
+
+pLastBoundary :: ByteString -> Parser ByteString
+pLastBoundary b = try $ do
+  string "--"
+  string b
+  string "--"
+
+pBoundaryEnd :: Parser Bool
+pBoundaryEnd = (eol *> pure False) <|> (string "--" *> pure True)
+
+-- parseLastBoundary :: ByteString -> Parser ()
+-- parseLastBoundary b = endOfInput <|> (pLastBoundary b <* eol) <|> (takeLine *> parseLastBoundary b)
 
 untilChar :: Char -> Parser ByteString
 untilChar c = takeTill (\x -> x == (c2w c)) 
@@ -139,31 +156,43 @@ grabPart = checkDone go
 
     process k (Match _) = lift $ runIteratee $ k EOF
 
-grabParts :: (Monad m) => Iteratee ByteString m a
+grabParts :: (MonadIO m) => Iteratee ByteString m a
                        -> Iteratee MatchInfo m [a]
 grabParts partIter = do
-  let iter = partIter >>= \x -> skipToEof >> return x
-  go iter []
+  let iter = do
+      isLast <- bParser
+      if isLast
+        then return Nothing
+        else do
+          x <- partIter
+          skipToEof
+          return $ Just x
+  iterateeDebugWrapper "grab parts" $ go iter []
   where
-    go :: (Monad m) => Iteratee ByteString m a 
+    go :: (MonadIO m) => Iteratee ByteString m (Maybe a)
                     -> [a] -- replace with DList
                     -> Iteratee MatchInfo m [a]
     go iter soFar = do
       b <- isEOF
+
       if b
         then return soFar
         else do
-          -- step :: Step ByteString m a
-          step <- lift $ runIteratee iter
+           -- step :: Step ByteString m a
+           step <- lift $ runIteratee iter
 
-          -- grabPart step :: Iteratee MatchInfo m (Step ByteString m a)
-          innerStep <- grabPart step
+           -- grabPart step :: Iteratee MatchInfo m (Step ByteString m a)
+           innerStep <- grabPart step
 
-          -- output :: a 
-          output <- lift $ run_ $ returnI innerStep
+           -- output :: Maybe a 
+           output <- lift $ run_ $ returnI innerStep
 
-          -- and recurse
-          go iter (output : soFar)
+           case output of 
+             Just x  -> go iter (x : soFar)
+             Nothing -> return soFar
+    
+    bParser :: (MonadIO m) => Iteratee ByteString m Bool
+    bParser = iterateeDebugWrapper "boundary debugger" $ iterParser $ pBoundaryEnd
 
 
 internalHandleMultipart :: (MonadIO m) => ByteString -- boundary
@@ -172,19 +201,22 @@ internalHandleMultipart :: (MonadIO m) => ByteString -- boundary
 internalHandleMultipart bound clientHandler = do
   -- kmpEnumeratee bound :: Enumeratee ByteString MatchInfo m1 a1
   -- runIteratee $ grabParts clientIter :: m (Step MatchInfo m [a])
+  bound <- iterParser $ parseFirstBoundary bound
   partsStep <- lift $ runIteratee $ grabParts $ compressIteratee clientHandler
   enumStep  <- iterateeDebugWrapper "kmp" $ kmpEnumeratee fullBound partsStep
+
+
 
   output <- lift $ run_ $ returnI enumStep
   return output
 
   where 
-    fullBound = S.concat ["--", bound, "\n"]
+    fullBound = S.concat ["\r\n", "--", bound]
 
     compressIteratee :: (MonadIO m) => (ParamHeaders -> Iteratee ByteString m a) -> Iteratee ByteString m a
     compressIteratee handler = do
---      headers <- iterateeDebugWrapper "header parser" $ iterParser pParamHeaders
-      handler $ ParamInfo "input1" Nothing
+      headers <- iterateeDebugWrapper "header parser" $ iterParser pParamHeaders
+      handler headers
 
   
 ------
@@ -193,30 +225,20 @@ testHandler _ = consume
 
 --
 testStr :: ByteString
-testStr = S.pack $ map c2w $ unlines [     
-        "------WebKitFormBoundaryoagG1yA8o4dcYBL2",
-        "Content-Disposition: form-data; name=\"input1\"",
-        "",
-        "hey",
-        "------WebKitFormBoundaryoagG1yA8o4dcYBL2",
-        "Content-Disposition: form-data; name=\"input2\"",
-        "",
-        "you",
-        "------WebKitFormBoundaryoagG1yA8o4dcYBL2",
-        "Content-Disposition: form-data; name=\"input3\"",
-        "",
-        "guys",
-        "------WebKitFormBoundaryoagG1yA8o4dcYBL2",
-        "Content-Disposition: form-data; name=\"file1\"; filename=\"test4.txt\"",
-        "Content-Type: text/plain",
-        "",
-        "21",
-        "",
-        "------WebKitFormBoundaryoagG1yA8o4dcYBL2--"
-        ]       
+testStr = s2b $ "------WebKitFormBoundaryoagG1yA8o4dcYBL2\r\nContent-Disposition: form-data; name=\"input1\"\r\n\r\nhey\r\n------WebKitFormBoundaryoagG1yA8o4dcYBL2\r\nContent-Disposition: form-data; name=\"input2\"\r\n\r\nyou\r\n------WebKitFormBoundaryoagG1yA8o4dcYBL2\r\nContent-Disposition: form-data; name=\"input3\"\r\n\r\nguys\r\n------WebKitFormBoundaryoagG1yA8o4dcYBL2\r\nContent-Disposition: form-data; name=\"file1\"; filename=\"test4.txt\"\r\nContent-Type: text/plain\r\n\r\n21\r\n\r\n------WebKitFormBoundaryoagG1yA8o4dcYBL2--\r\n"
+
+testStr2 = s2b $ "------WebKitFormBoundaryorypxRjAcffML0UV\r\nContent-Disposition: form-data; name=\"input1\"\r\n\r\nthis\r\n------WebKitFormBoundaryorypxRjAcffML0UV\r\nContent-Disposition: form-data; name=\"input2\"\r\n\r\nis\r\n------WebKitFormBoundaryorypxRjAcffML0UV\r\nContent-Disposition: form-data; name=\"input3\"\r\n\r\na\r\n------WebKitFormBoundaryorypxRjAcffML0UV\r\nContent-Disposition: form-data; name=\"file1\"; filename=\"fnce-exam-notes.org\"\r\n\r\n* 10 Qs on \n\r\n------WebKitFormBoundaryorypxRjAcffML0UV--\r\n"
+
+testStr3 = s2b $ "------WebKitFormBoundarynQqnp4UlAoFN3BIl\r\nContent-Disposition: form-data; name=\"input1\"\r\n\r\nthis\r\n------WebKitFormBoundarynQqnp4UlAoFN3BIl\r\nContent-Disposition: form-data; name=\"input2\"\r\n\r\nis\r\n------WebKitFormBoundarynQqnp4UlAoFN3BIl\r\nContent-Disposition: form-data; name=\"input3\"\r\n\r\na\r\n------WebKitFormBoundarynQqnp4UlAoFN3BIl\r\nContent-Disposition: form-data; name=\"file1\"; filename=\"somalinotes.txt\"\r\nContent-Type: text/plain\r\n\r\nOutline:\n\nSomalia - where it is/what it is/governmental issues\nfishermen make no money\nPirates make a ton\nsocial status of pirates\nvideo(?)\nWhy pirates do it - their rationale at least\nProblem growing over last 2-3 years\nWhere the money goes\nThesis\n\n\nWhy?\n1) government supports piracy\n2) government fails to protect somali waters from fishing, illegal dumping, so people have to take it upon themselves\n3) Fisherman can't fish if the water's overfished\n4) Huge payoff, quick money\r\n------WebKitFormBoundarynQqnp4UlAoFN3BIl--\r\n"
 
 testHand :: Iteratee ByteString IO [[ByteString]]
 testHand =  internalHandleMultipart "----WebKitFormBoundaryoagG1yA8o4dcYBL2" testHandler
+
+testHand2 :: Iteratee ByteString IO [[ByteString]]
+testHand2 =  internalHandleMultipart "----WebKitFormBoundaryorypxRjAcffML0UV" testHandler
+
+testHand3 :: Iteratee ByteString IO [[ByteString]]
+testHand3 =  internalHandleMultipart "----WebKitFormBoundarynQqnp4UlAoFN3BIl" testHandler
 
 s2b x = S.pack $ map c2w x
 
@@ -224,4 +246,15 @@ s2b x = S.pack $ map c2w x
 testAct = do
   step <- liftIO $ runIteratee testHand
   enumBS testStr step
+
+--testAct :: (MonadSnap m) => m [L.ByteString]
+testAct2 = do
+  step <- liftIO $ runIteratee testHand2
+  enumBS testStr2 step
+
+--testAct :: (MonadSnap m) => m [L.ByteString]
+testAct3 = do
+  step <- liftIO $ runIteratee testHand3
+  enumBS testStr3 step
   
+
