@@ -14,7 +14,6 @@ import           Control.Applicative
 import           Control.Monad
 import           Control.Monad.State
 import qualified Data.ByteString as S
-import qualified Data.ByteString.Lazy as L
 import           Data.ByteString (ByteString)
 import           Data.ByteString.Internal (c2w, w2c)
 import           Data.Char
@@ -85,7 +84,7 @@ crlf = string "\r\n"
 
 pBoundary :: ByteString -> Parser ByteString
 pBoundary boundary = try $ do
-  string "--"
+  _ <-string "--"
   string boundary
   
 getLine :: Parser ByteString
@@ -100,8 +99,8 @@ parseFirstBoundary b = pBoundary b <|> (takeLine *> parseFirstBoundary b)
 
 pLastBoundary :: ByteString -> Parser ByteString
 pLastBoundary b = try $ do
-  string "--"
-  string b
+  _ <- string "--"
+  _ <- string b
   string "--"
 
 pBoundaryEnd :: Parser Bool
@@ -201,7 +200,7 @@ internalHandleMultipart :: (MonadIO m) => ByteString -- boundary
 internalHandleMultipart bound clientHandler = do
   -- kmpEnumeratee bound :: Enumeratee ByteString MatchInfo m1 a1
   -- runIteratee $ grabParts clientIter :: m (Step MatchInfo m [a])
-  bound <- iterParser $ parseFirstBoundary bound
+  _ <- iterParser $ parseFirstBoundary bound
   partsStep <- lift $ runIteratee $ grabParts $ compressIteratee clientHandler
   enumStep  <- iterateeDebugWrapper "kmp" $ kmpEnumeratee fullBound partsStep
 
