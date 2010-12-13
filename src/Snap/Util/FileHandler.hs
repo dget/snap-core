@@ -18,6 +18,7 @@ import           Data.ByteString.Internal (c2w, w2c)
 import           Data.Char
 import           Data.Int
 import           Data.Word (Word8)
+import qualified Data.DList as D
 import           Prelude hiding (take, takeWhile, getLine)
 ------------------------------------------------------------------------------
 import           Snap.Internal.Debug
@@ -165,16 +166,16 @@ grabParts partIter = do
           x <- partIter
           skipToEof
           return $ Just x
-  iterateeDebugWrapper "grab parts" $ go iter []
+  iterateeDebugWrapper "grab parts" $ go iter D.empty
   where
     go :: (MonadIO m) => Iteratee ByteString m (Maybe a)
-                    -> [a] -- replace with DList
+                    -> D.DList a
                     -> Iteratee MatchInfo m [a]
     go iter soFar = do
       b <- isEOF
 
       if b
-        then return soFar
+        then return $ D.toList soFar
         else do
            -- step :: Step ByteString m a
            step <- lift $ runIteratee iter
@@ -186,8 +187,8 @@ grabParts partIter = do
            output <- lift $ run_ $ returnI innerStep
 
            case output of 
-             Just x  -> go iter (x : soFar)
-             Nothing -> return soFar
+             Just x  -> go iter (D.append soFar $ D.singleton x)
+             Nothing -> return $ D.toList soFar
     
     bParser :: (MonadIO m) => Iteratee ByteString m Bool
     bParser = iterateeDebugWrapper "boundary debugger" $ iterParser $ pBoundaryEnd
